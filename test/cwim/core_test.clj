@@ -2,6 +2,9 @@
   (:require [clojure.test :refer :all]
             [cwim.core :refer :all]))
 
-(deftest a-test
-  (testing "FIXME, I fail."
-    (is (= 0 1))))
+(deftest add-node-test
+  (testing "Add a single node"
+    (let [srv-map {:state (atom {:cwim.core/nodes '()})}
+          updated-map (add-node srv-map "0.0.0.0")]
+      (is (contains? (set (:cwim.core/nodes @(:state updated-map)))
+                     {:host "0.0.0.0" :port default-port})))))
