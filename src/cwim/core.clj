@@ -10,12 +10,55 @@
   ([srv msg]
     true))
 
+(def default-port 64321)
+
+(defn swap-return-atom! [atom f & xs]
+  (apply swap! atom f xs)
+  atom)
+
+(defn read-internal-state [srv key]
+  (-> srv
+      :internal-state
+      deref
+      key))
+
+(defn update-internal-state [srv fn & args]
+  (update srv :internal-state swap-return-atom! #(apply fn %1 args)))
+
+(defn add-node
+  "Add another node to gossip to"
+  ([srv host] (add-node srv host default-port))
+  ([srv host port]
+   (if-not (some #{{:host host :port port}} (read-internal-state srv :nodes))
+     (-> srv
+         (update-internal-state update :nodes conj {:host host :port port})
+         (update-internal-state update :nodes shuffle)
+         (update-internal-state update :send-queue conj [::node-added {:host host
+                                                                       :port port}]))
+     srv)))
+
+(defmulti process-msg (fn [srv [key _]] key))
+
+(defmethod process-msg ::node-added
+  [{:keys [cfg] :as srv} [_ {:keys [host port] :as val}]]
+  (when-not (= val (select-keys cfg [:host :port]))         ;Ignore notes about ourselves
+    (add-node srv host port)))
+
+(defmethod process-msg :default
+  [srv [key val]]
+  (swap! (:state srv) assoc key val))
+
 (defn make-ping-handler [srv]
   "Handler to recv ping messages from other nodes and add updates to state"
   (fn [req]
+    ;(prn "Request:" req)
     (when (validate-req srv (:body req))
-      (let [messages (get-in req [:body :messages])]
-        (swap! (:state srv) #(apply assoc %1 (apply concat messages)))))))
+      (let [body (edn/read-string (slurp (.bytes (:body req))))
+            from (:from body)] ;TODO Change this. Perf is probably absymal.
+        ;(prn "Body:" body)
+        (add-node srv (:host from) (:port from))
+        (dorun (map (partial process-msg srv) (:messages body)))
+        #_(swap! (:state srv) #(apply assoc %1 (apply concat messages)))))))
 
 (defn make-hello-handler [srv])
 
@@ -27,12 +70,13 @@
       (concat [elem])))
 
 (defn send-impl [target msg completed-fn]
-  (hc/post target
-           (pr-str msg)
-           (fn [res]
-             (if (= 200 (:status res))
-               (completed-fn (edn/read-string (:body res)))
-               (completed-fn false)))))
+  (let [target-str  (str "http://" (:host target) ":" (:port target))]
+    (hc/post target-str
+             {:body (pr-str msg)}
+             (fn [res]
+               (if (= 200 (:status res))
+                 (completed-fn (edn/read-string (:body res)))
+                 (completed-fn false))))))
 
 (defn indirect-ping [node])
 
@@ -46,28 +90,31 @@
       (swap! internal-state update :nodes move-elem-to-end-of-coll target)
       (suspect target))))
 
+(defn make-message
+  ([{:keys [internal-state cfg]}]
+    (let [msgs-to-send (-> (if-let [max (:max-msgs-per-epoch cfg)]
+                             (take max (:send-queue @internal-state))
+                             (:send-queue @internal-state)))]
+      {:messages msgs-to-send
+       :from     (select-keys cfg [:host :port])
+       :epoch    (inc (:epoch @internal-state))})))
+
 (defn ping
-  ([{:keys [state internal-state cfg] :as srv}]
+  ([{:keys [internal-state cfg] :as srv}]
    (let [internal-state @internal-state
          target-nodes (take (:gossip-send-count cfg) (:nodes internal-state))
-         msgs-to-send (-> (if-let [max (:max-msgs-per-epoch cfg)]
-                            (take max (:send-queue internal-state))
-                            (:send-queue internal-state)))
+         msg (make-message srv)
          send-fn (:send-fn cfg)]
-     (prn "Pinging to " target-nodes " with " msgs-to-send " using " send-fn)
+     #_(prn "Pinging to " target-nodes " with " msgs-to-send " using " send-fn)
      ;TODO: replace below with something more robust...
-     (swap! (:internal-state srv) #(vec (drop (count msgs-to-send) %1))) ;Remove messages we're about to send from server state
-     (dorun (map #(send-fn %1 msgs-to-send (create-completion-fn %1 (:internal-state srv))) target-nodes)))))
+     ;Remove messages we're about to send from server state
+     (swap! (:internal-state srv) update :send-queue #(vec (drop (count (:messages msg)) %1)))
+     (dorun (map #(send-fn %1 msg (create-completion-fn %1 (:internal-state srv))) target-nodes)))))
 
 (defn dead [node])
 
-(defn swap-return-atom! [atom f & xs]
-  (apply swap! atom f xs)
-  atom)
 
-(def default-port 64321)
-
-(def default-cfg {:host               "0.0.0.0"
+(def default-cfg {:host               "127.0.0.1"
                   :port               default-port
                   :max-msgs-per-epoch nil                   ;nil = unlimted
                   :gossip-send-count  5
@@ -120,12 +167,11 @@
                                      (prn "Shutdown not defined, doing nothing...")
                                      nil)) srv))
 
-(defn add-node
-  "Add another node to gossip to"
-  ([srv host] (add-node srv host default-port))
-  ([srv host port] (-> srv
-                     (update :internal-state swap-return-atom! update :nodes conj {:host host :port port})
-                     (update :internal-state swap-return-atom! update :nodes shuffle))))
+(defn get-epoch [srv]
+  (-> srv
+      :internal-state
+      deref
+      :epoch))
 
 (defn send-msg
   ([srv key val]
