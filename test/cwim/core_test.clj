@@ -1,7 +1,9 @@
 (ns cwim.core-test
   (:require [clojure.test :refer :all]
             [cwim.core :refer :all]
-            [clojure.core.async :as a]))
+            [clojure.core.async :as a]
+            [org.httpkit.server :as hs]
+            [clojure.edn :as edn]))
 
 (def short-time-cfg (assoc default-cfg :ping-timer 500))
 
@@ -50,7 +52,6 @@
           srv2 (start (assoc short-time-cfg :port 65445))]
       (add-node srv1 "127.0.0.1" 65445)
       (a/<!! (a/timeout (* 2 (:ping-timer short-time-cfg))))
-      ;(prn @(:internal-state srv2))
       (is (= (:nodes @(:internal-state srv2)) [(select-keys (:cfg srv1) [:host :port])]))
       (stop srv1)
       (stop srv2)))
@@ -66,4 +67,6 @@
                    (select-keys (:cfg srv2) [:host :port])])))
       (stop srv1)
       (stop srv2)
-      (stop srv3))))
+      (stop srv3)))
+  (testing "Messages sent to other nodes")
+  (testing "Stopped nodes are dropped"))

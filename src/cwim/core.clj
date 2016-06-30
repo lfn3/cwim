@@ -25,6 +25,9 @@
 (defn update-internal-state [srv fn & args]
   (update srv :internal-state swap-return-atom! #(apply fn %1 args)))
 
+(defn add-to-send-queue [srv msg]
+  (update-internal-state srv update :send-queue conj (with-meta msg {:sent #{}})))
+
 (defn add-node
   "Add another node to gossip to"
   ([srv host] (add-node srv host default-port))
@@ -33,8 +36,8 @@
      (-> srv
          (update-internal-state update :nodes conj {:host host :port port})
          (update-internal-state update :nodes shuffle)
-         (update-internal-state update :send-queue conj [::node-added {:host host
-                                                                       :port port}]))
+         (add-to-send-queue [::node-added {:host host
+                                           :port port}]))
      srv)))
 
 (defmulti process-msg (fn [srv [key _]] key))
@@ -51,14 +54,11 @@
 (defn make-ping-handler [srv]
   "Handler to recv ping messages from other nodes and add updates to state"
   (fn [req]
-    ;(prn "Request:" req)
     (when (validate-req srv (:body req))
-      (let [body (edn/read-string (slurp (.bytes (:body req))))
-            from (:from body)] ;TODO Change this. Perf is probably absymal.
-        ;(prn "Body:" body)
+      (let [body (edn/read-string (slurp (.bytes (:body req)))) ;TODO Change this. Perf is probably absymal.
+            from (:from body)]
         (add-node srv (:host from) (:port from))
-        (dorun (map (partial process-msg srv) (:messages body)))
-        #_(swap! (:state srv) #(apply assoc %1 (apply concat messages)))))))
+        (dorun (map (partial process-msg srv) (:messages body)))))))
 
 (defn make-hello-handler [srv])
 
@@ -84,10 +84,21 @@
   ;TODO: add to suspect list
   (indirect-ping node))
 
-(defn create-completion-fn [target internal-state]
+(defn inc-or-remove-msg [vec msg target send-count]
+  (let [idx (.indexOf vec msg)
+        elem (get vec idx)
+        updated-meta (update (meta elem) :sent conj target)]
+    (prn updated-meta)
+    (if (> send-count (count (:sent updated-meta)))
+      (assoc vec idx (with-meta elem updated-meta))
+      (concat (subvec vec 0 idx) (subvec vec (+ idx 1) (count vec))))))
+
+(defn create-completion-fn [target msg internal-state send-count]
   (fn [body]
     (if body
-      (swap! internal-state update :nodes move-elem-to-end-of-coll target)
+      (do
+        (swap! internal-state update :nodes move-elem-to-end-of-coll target)
+        (swap! internal-state update :msg-queue inc-or-remove-msg msg target (max (count (:nodes internal-state)) send-count)))
       (suspect target))))
 
 (defn make-message
@@ -105,14 +116,9 @@
          target-nodes (take (:gossip-send-count cfg) (:nodes internal-state))
          msg (make-message srv)
          send-fn (:send-fn cfg)]
-     #_(prn "Pinging to " target-nodes " with " msgs-to-send " using " send-fn)
-     ;TODO: replace below with something more robust...
-     ;Remove messages we're about to send from server state
-     (swap! (:internal-state srv) update :send-queue #(vec (drop (count (:messages msg)) %1)))
-     (dorun (map #(send-fn %1 msg (create-completion-fn %1 (:internal-state srv))) target-nodes)))))
+     (dorun (map #(send-fn %1 msg (create-completion-fn %1 msg (:internal-state srv) (:gossip-send-count cfg))) target-nodes)))))
 
 (defn dead [node])
-
 
 (def default-cfg {:host               "127.0.0.1"
                   :port               default-port
@@ -176,7 +182,7 @@
 (defn send-msg
   ([srv key val]
    (-> srv
-       (update :send-queue conj [key val])
+       (add-to-send-queue [key val])
        (assoc-in [:state key] val))))
 
 ;TODO: replace this by making srv return state when derefed.
