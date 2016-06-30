@@ -122,6 +122,7 @@
 
 (def default-cfg {:host               "127.0.0.1"
                   :port               default-port
+                  :node-data          {}                    ;info about this node
                   :max-msgs-per-epoch nil                   ;nil = unlimted
                   :gossip-send-count  5
                   :ping-timer         5000
@@ -183,9 +184,22 @@
   ([srv key val]
    (-> srv
        (add-to-send-queue [key val])
-       (assoc-in [:state key] val))))
+       :state
+       (swap! assoc key val))
+    ;All the operations here operate on the atoms, so this should be fine.
+    srv))
+
+(defn nodes
+  [srv]
+  (-> srv
+      :internal-state
+      (deref)
+      :nodes))
 
 ;TODO: replace this by making srv return state when derefed.
 (defn query
   ([srv key]
-    (get-in srv [:state key])))
+   (-> srv
+       :state
+       (deref)
+       (get key))))
