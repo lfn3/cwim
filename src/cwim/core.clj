@@ -19,7 +19,7 @@
 (defn read-internal-state [srv key]
   (-> srv
       :internal-state
-      deref
+      (deref)
       key))
 
 (defn update-internal-state [srv fn & args]
@@ -32,13 +32,17 @@
   "Add another node to gossip to"
   ([srv host] (add-node srv host default-port))
   ([srv host port]
-   (if-not (some #{{:host host :port port}} (read-internal-state srv :nodes))
-     (-> srv
-         (update-internal-state update :nodes conj {:host host :port port})
-         (update-internal-state update :nodes shuffle)
-         (add-to-send-queue [::node-added {:host host
-                                           :port port}]))
-     srv)))
+   (let [k {:host host :port port}]
+     (if-not (get (read-internal-state srv :nodes) k)
+       (-> srv
+           (update-internal-state update :nodes assoc k {:data {}
+                                                         :state :alive
+                                                         :last-sent-epoch (read-internal-state srv :epoch)})
+           (update-internal-state update :ordered-hosts conj k)
+           (update-internal-state update :ordered-hosts shuffle)
+           (add-to-send-queue [::node-added {:host host
+                                             :port port}]))
+       srv))))
 
 (defmulti process-msg (fn [srv [key _]] key))
 
@@ -80,7 +84,8 @@
 
 (defn indirect-ping [node])
 
-(defn suspect [node]
+(defn suspect [node internal-state]
+  (swap! internal-state update-in [:nodes node] assoc :state :suspect)
   ;TODO: add to suspect list
   (indirect-ping node))
 
@@ -97,15 +102,20 @@
   (fn [body]
     (if body
       (do
-        (swap! internal-state update :nodes move-elem-to-end-of-coll target)
-        (swap! internal-state update :msg-queue inc-or-remove-msg msg target (max (count (:nodes internal-state)) send-count)))
-      (suspect target))))
+        (swap! internal-state update :ordered-hosts move-elem-to-end-of-coll target)
+        (swap! internal-state update
+               :msg-queue
+               inc-or-remove-msg
+               msg
+               target
+               (max (count (:ordered-hosts internal-state)) send-count)))
+      (suspect target internal-state))))
 
 (defn make-message
   ([{:keys [internal-state cfg]}]
-    (let [msgs-to-send (-> (if-let [max (:max-msgs-per-epoch cfg)]
-                             (take max (:send-queue @internal-state))
-                             (:send-queue @internal-state)))]
+    (let [msgs-to-send (if-let [max (:max-msgs-per-epoch cfg)]
+                         (take max (:send-queue @internal-state))
+                         (:send-queue @internal-state))]
       {:messages msgs-to-send
        :from     (select-keys cfg [:host :port])
        :epoch    (inc (:epoch @internal-state))})))
@@ -113,7 +123,7 @@
 (defn ping
   ([{:keys [internal-state cfg] :as srv}]
    (let [internal-state @internal-state
-         target-nodes (take (:gossip-send-count cfg) (:nodes internal-state))
+         target-nodes (take (:gossip-send-count cfg) (:ordered-hosts internal-state))
          msg (make-message srv)
          send-fn (:send-fn cfg)]
      (dorun (map #(send-fn %1 msg (create-completion-fn %1 msg (:internal-state srv) (:gossip-send-count cfg))) target-nodes)))))
@@ -131,7 +141,10 @@
                   })
 
 (defn srv-map [] {:cfg            default-cfg
-                  :internal-state (atom {:nodes '() ; ::nodes {:host "0.0.0.0" :port 1234}
+                  :internal-state (atom {:nodes {} ; {{:host "0.0.0.0" :port 1234} {:data {}
+                                                                                  ; :state :alive or :suspect
+                                                                                  ; :last-sent-epoch 123}}
+                                         :ordered-hosts '() ;{:host "0.0.0.0" :port 1234}
                                          :send-queue []
                                          :epoch 0})
                   :state      (atom {})

@@ -10,8 +10,8 @@
 (deftest add-node-test
   (testing "Add a single node"
     (let [updated-map (add-node (srv-map) "0.0.0.0")]
-      (is (contains? (set (:nodes @(:internal-state updated-map)))
-                     {:host "0.0.0.0" :port default-port}))))
+      (is (get (:nodes @(:internal-state updated-map))
+               {:host "0.0.0.0" :port default-port}))))
 
   (testing "Adding nodes reshuffles order"
     (let [matching-sort-count (atom 0)
@@ -52,7 +52,8 @@
           srv2 (start (assoc short-time-cfg :port 65445))]
       (add-node srv1 "127.0.0.1" 65445)
       (a/<!! (a/timeout (* 2 (:ping-timer short-time-cfg))))
-      (is (= (:nodes @(:internal-state srv2)) [(select-keys (:cfg srv1) [:host :port])]))
+      (is (= (first (keys (nodes srv2))) {:host (get-in srv1 [:cfg :host])
+                                          :port (get-in srv1 [:cfg :port])}))
       (stop srv1)
       (stop srv2)))
   (testing "Add messages propagate"
@@ -62,7 +63,7 @@
       (add-node srv1 "127.0.0.1" 65445)
       (add-node srv2 "127.0.0.1" 65446)
       (a/<!! (a/timeout (* 3 (:ping-timer short-time-cfg))))
-      (is (= (set (nodes srv3))
+      (is (= (set (keys (nodes srv3)))
              (set [(select-keys (:cfg srv1) [:host :port])
                    (select-keys (:cfg srv2) [:host :port])])))
       (stop srv1)
@@ -72,7 +73,6 @@
     (let [srv1 (start short-time-cfg)
           srv2 (start (assoc short-time-cfg :port 65445))]
       (add-node srv1 "127.0.0.1" 65445)
-      (add-node srv2 "127.0.0.1")
       (send-msg srv1 :test :hello)
       (a/<!! (a/timeout (* 3 (:ping-timer short-time-cfg))))
       (is (= (query srv2 :test)
