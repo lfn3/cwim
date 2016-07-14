@@ -37,6 +37,7 @@
        (-> srv
            (update-internal-state update :nodes assoc k {:data {}
                                                          :state :alive
+                                                         :clk 0
                                                          :last-sent-epoch (read-internal-state srv :epoch)})
            (update-internal-state update :ordered-hosts conj k)
            (update-internal-state update :ordered-hosts shuffle)
@@ -44,7 +45,7 @@
                                              :port port}]))
        srv))))
 
-(defmulti process-msg (fn [srv [key _]] key))
+(defmulti process-msg (fn [_ [key _]] key))
 
 (defmethod process-msg ::node-added
   [{:keys [cfg] :as srv} [_ {:keys [host port] :as val}]]
@@ -57,12 +58,13 @@
 
 (defn make-ping-handler [srv]
   "Handler to recv ping messages from other nodes and add updates to state"
+  ;TODO: this now needs to handle receiving acks as well.
   (fn [req]
     (when (validate-req srv (:body req))
       (let [body (edn/read-string (slurp (.bytes (:body req)))) ;TODO Change this. Perf is probably absymal.
             from (:from body)]
         (add-node srv (:host from) (:port from))
-        (dorun (map (partial process-msg srv) (:messages body)))))))
+        (dorun (map (partial process-msg srv) (:messages body))))))) ;TODO: send ack on ping
 
 (defn make-hello-handler [srv])
 
@@ -73,43 +75,38 @@
       ((partial remove #(= %1 elem)))
       (concat [elem])))
 
-(defn send-impl [target msg completed-fn]
+(defn send-impl [target msg]
   (let [target-str  (str "http://" (:host target) ":" (:port target))]
     (hc/post target-str
-             {:body (pr-str msg)}
-             (fn [res]
-               (if (= 200 (:status res))
-                 (completed-fn (edn/read-string (:body res)))
-                 (completed-fn false))))))
+             {:body (pr-str msg)})))
 
-(defn indirect-ping [node])
+(defn indirect-ping [node clk])
 
 (defn suspect [node internal-state]
   (swap! internal-state update-in [:nodes node] assoc :state :suspect)
   ;TODO: add to suspect list
-  (indirect-ping node))
+  (indirect-ping node (get-in @internal-state [:nodes node :clk])))
 
 (defn inc-or-remove-msg [vec msg target send-count]
   (let [idx (.indexOf vec msg)
         elem (get vec idx)
         updated-meta (update (meta elem) :sent conj target)]
-    (prn updated-meta)
     (if (> send-count (count (:sent updated-meta)))
       (assoc vec idx (with-meta elem updated-meta))
       (concat (subvec vec 0 idx) (subvec vec (+ idx 1) (count vec))))))
 
-(defn create-completion-fn [target msg internal-state send-count]
-  (fn [body]
-    (if body
-      (do
-        (swap! internal-state update :ordered-hosts move-elem-to-end-of-coll target)
-        (swap! internal-state update
-               :msg-queue
-               inc-or-remove-msg
-               msg
-               target
-               (max (count (:ordered-hosts internal-state)) send-count)))
-      (suspect target internal-state))))
+(defn create-completion-fn [target msg internal-state {:keys [send-count ack-timeout]}]
+  (let [acked-ch (a/timeout ack-timeout)]
+    (a/go (when-not (a/<! acked-ch) (suspect target internal-state)))
+    (fn []
+      (a/put! acked-ch true)
+      (swap! internal-state update :ordered-hosts move-elem-to-end-of-coll target)
+      (swap! internal-state update
+             :msg-queue
+             inc-or-remove-msg
+             msg
+             target
+             (max (count (:ordered-hosts internal-state)) send-count)))))
 
 (defn make-message
   ([{:keys [internal-state cfg]}]
@@ -122,11 +119,15 @@
 
 (defn ping
   ([{:keys [internal-state cfg] :as srv}]
-   (let [internal-state @internal-state
-         target-nodes (take (:gossip-send-count cfg) (:ordered-hosts internal-state))
+   (let [target-nodes (take (:gossip-send-count cfg) (:ordered-hosts @internal-state))
          msg (make-message srv)
          send-fn (:send-fn cfg)]
-     (dorun (map #(send-fn %1 msg (create-completion-fn %1 msg (:internal-state srv) (:gossip-send-count cfg))) target-nodes)))))
+     (doseq [node target-nodes]
+       (send-fn node msg)
+       (let [completion-fn (create-completion-fn node msg internal-state cfg)]
+         (swap! internal-state update-in [:nodes node] assoc :completion-fn completion-fn)))
+     (dorun (map #(send-fn %1 msg) target-nodes))
+     )))
 
 (defn dead [node])
 
@@ -136,6 +137,7 @@
                   :max-msgs-per-epoch nil                   ;nil = unlimted
                   :gossip-send-count  5
                   :ping-timer         5000
+                  :ack-timeout        2000
                   :send-fn            send-impl             ;(fn [host msgs completion-fn]) -> nil
                   :shutdown-fn        (fn [srv] nil)        ;TODO move this around?
                   })
@@ -143,6 +145,7 @@
 (defn srv-map [] {:cfg            default-cfg
                   :internal-state (atom {:nodes {} ; {{:host "0.0.0.0" :port 1234} {:data {}
                                                                                   ; :state :alive or :suspect
+                                                                                  ; :clk 0
                                                                                   ; :last-sent-epoch 123}}
                                          :ordered-hosts '() ;{:host "0.0.0.0" :port 1234}
                                          :send-queue []

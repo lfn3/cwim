@@ -26,7 +26,7 @@
 (deftest start-server-test
   (testing "Send-fn is called on ping"
     (let [call-count (atom 0)
-          cfg (merge short-time-cfg {:send-fn    (fn [_ _ _] (swap! call-count inc))})
+          cfg (merge short-time-cfg {:send-fn    (fn [_ _] (swap! call-count inc))})
           srv (start cfg)]
       (add-node srv "0.0.0.0")
       (a/<!! (a/timeout (* 3 (:ping-timer cfg))))
