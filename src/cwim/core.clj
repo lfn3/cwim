@@ -45,6 +45,9 @@
                                              :port port}]))
        srv))))
 
+(defn add-node-from-srv
+  ([srv other-srv] (add-node srv (get-in other-srv [:cfg :host]) (get-in other-srv [:cfg :port]))))
+
 (defmulti process-msg (fn [_ [key _]] key))
 
 (defmethod process-msg ::node-added
@@ -82,10 +85,23 @@
 
 (defn indirect-ping [node clk])
 
-(defn suspect [node internal-state]
-  (swap! internal-state update-in [:nodes node] assoc :state :suspect)
-  ;TODO: add to suspect list
-  (indirect-ping node (get-in @internal-state [:nodes node :clk])))
+(defn dead [node internal-state]
+  (swap! internal-state assoc-in [:nodes node :state] :dead)
+  (swap! internal-state update-in [:nodes node :clk] inc)
+  (swap! internal-state update :ordered-hosts (partial remove #(= node %1))))
+
+;TODO clean these up on shutdown of server.
+(defn start-suspect-proc [node internal-state {:keys [ack-timeout suspect-timeout]}]
+  (let [ack-ch (a/timeout ack-timeout)]
+    (a/go
+      (when-not (a/<! ack-ch)
+        (let [suspect-clk (get-in @internal-state [:nodes node :clk])]
+          (swap! internal-state update-in [:nodes node] assoc :state :suspect)
+          (indirect-ping node (get-in @internal-state [:nodes node :clk]))
+          (a/<! (a/timeout suspect-timeout))
+          (when (= suspect-clk (get-in @internal-state [:nodes node :clk]))
+            (dead node internal-state)))))
+    ack-ch))
 
 (defn inc-or-remove-msg [vec msg target send-count]
   (let [idx (.indexOf vec msg)
@@ -95,12 +111,10 @@
       (assoc vec idx (with-meta elem updated-meta))
       (concat (subvec vec 0 idx) (subvec vec (+ idx 1) (count vec))))))
 
-(defn create-completion-fn [target msg internal-state {:keys [send-count ack-timeout]}]
-  (let [acked-ch (a/timeout ack-timeout)]
-    (a/go (when-not (a/<! acked-ch) (suspect target internal-state)))
+(defn create-completion-fn [target msg internal-state {:keys [send-count] :as cfg}]
+  (let [sus-ch (start-suspect-proc target internal-state cfg)]
     (fn []
-      (a/put! acked-ch true)
-      (swap! internal-state update :ordered-hosts move-elem-to-end-of-coll target)
+      (a/put! sus-ch true)
       (swap! internal-state update
              :msg-queue
              inc-or-remove-msg
@@ -124,12 +138,11 @@
          send-fn (:send-fn cfg)]
      (doseq [node target-nodes]
        (send-fn node msg)
+       (swap! internal-state update :ordered-hosts move-elem-to-end-of-coll node)
        (let [completion-fn (create-completion-fn node msg internal-state cfg)]
          (swap! internal-state update-in [:nodes node] assoc :completion-fn completion-fn)))
      (dorun (map #(send-fn %1 msg) target-nodes))
      )))
-
-(defn dead [node])
 
 (def default-cfg {:host               "127.0.0.1"
                   :port               default-port
@@ -137,6 +150,7 @@
                   :max-msgs-per-epoch nil                   ;nil = unlimted
                   :gossip-send-count  5
                   :ping-timer         5000
+                  :suspect-timeout    10000
                   :ack-timeout        2000
                   :send-fn            send-impl             ;(fn [host msgs completion-fn]) -> nil
                   :shutdown-fn        (fn [srv] nil)        ;TODO move this around?
@@ -207,10 +221,11 @@
 
 (defn nodes
   [srv]
-  (-> srv
-      :internal-state
-      (deref)
-      :nodes))
+  (->> srv
+       :internal-state
+       (deref)
+       :nodes
+       (filter #(not= :dead (:state (val %1))))))
 
 ;TODO: replace this by making srv return state when derefed.
 (defn query
