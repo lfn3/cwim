@@ -3,7 +3,9 @@
             [org.httpkit.client :as hc]
             [clojure.core.async :as a]
             [clojure.edn :as edn]
-            [clojure.spec :as s]))
+            [clojure.spec :as s]
+            [clojure.spec.gen :as gen]
+            [clojure.string :as str]))
 
 ;TODO: implement me!
 (defn validate-req
@@ -60,19 +62,23 @@
   [srv [key val]]
   (swap! (::state srv) assoc key val))
 
-(defn make-ping-handler [srv]
-  "Handler to recv ping messages from other nodes and add updates to state"
+(defmulti handler (fn [msg srv] (::type msg)))
+
+(defmethod handler :ping [{:keys [cwim.core/from] :as body} srv]
+  (add-node srv (::host from) (::port from))
+  (dorun (map (partial process-msg srv) (::messages body))))
+
+(defn ping-handler [])
+
+(defn indirect-ping-hander [srv])
+
+(defn make-handler [srv]
+  "Handler to recv messages from other nodes"
   ;TODO: this now needs to handle receiving acks as well.
   (fn [req]
     (when (validate-req srv (:body req))
-      (let [body (edn/read-string (slurp (.bytes (:body req)))) ;TODO Change this. Perf is probably absymal.
-            from (::from body)]
-        (add-node srv (::host from) (::port from))
-        (dorun (map (partial process-msg srv) (::messages body))))))) ;TODO: send ack on ping
-
-(defn make-hello-handler [srv])
-
-(defn make-indirect-ping-handler [srv])
+      (let [body (edn/read-string (slurp (.bytes (:body req))))] ;TODO Change this. Perf is probably absymal.
+        (handler body srv))))) ;TODO: send ack on ping
 
 (defn move-elem-to-end-of-coll [coll elem]
   (-> coll
@@ -84,7 +90,7 @@
     (hc/post target-str
              {:body (pr-str msg)})))
 
-(defn indirect-ping [node clk])
+(defn indirect-ping [node internal-state])
 
 (defn dead [node internal-state]
   (swap! internal-state assoc-in [::nodes node ::state] :dead)
@@ -98,7 +104,7 @@
       (when-not (a/<! ack-ch)
         (let [suspect-clk (get-in @internal-state [::nodes node ::clk])]
           (swap! internal-state update-in [::nodes node] assoc ::state :suspect)
-          (indirect-ping node (get-in @internal-state [::nodes node ::clk]))
+          (indirect-ping node @internal-state)
           (a/<! (a/timeout suspect-timeout))
           (when (= suspect-clk (get-in @internal-state [::nodes node ::clk]))
             (dead node internal-state)))))
@@ -129,6 +135,7 @@
                          (take max (::send-queue @internal-state))
                          (::send-queue @internal-state))]
       {::messages msgs-to-send
+       ::type      :ping
        ::from     (select-keys cfg [::host ::port])
        ::epoch    (inc (::epoch @internal-state))})))
 
@@ -156,45 +163,6 @@
                   ::shutdown-fn (fn [srv] nil)        ;TODO move this around?
                   })
 
-
-(s/def ::host (s/and string?
-                     #(>= (count "111.111.111.111") (count %1))))
-(s/def ::port int?)
-
-(s/def ::other-node-data associative?)
-(s/def ::node-state #{:alive :suspect :dead})
-(s/def ::clk int?)
-(s/def ::last-sent-epoch int?)
-
-(s/def ::host-key-map (s/keys :req [::host ::port]))
-
-(s/def ::other-nodes (s/map-of ::host-key-map
-                               (s/keys :req [::other-node-data ::node-state ::clk ::last-sent-epoch])))
-
-(s/def ::ordered-hosts (s/coll-of ::host-key-map))
-(s/def ::internal-state (s/keys :req [::other-nodes ::ordered-hosts ::send-queue ::epoch]))
-(s/def ::state associative?)
-
-(s/def ::max-msgs-per-epoch pos-int?)
-(s/def ::gossip-send-count pos-int?)
-(s/def ::ping-timer (s/and pos-int? #(>= % 1000)))
-(s/def ::suspect-timeout (s/and pos-int? #(>= % 1000)))
-(s/def ::ack-timeout (s/and pos-int? #(>= % 1000)))
-(s/def ::send-fn fn?)
-(s/def ::shutdown-fn fn?)
-
-(s/def ::cfg (s/keys :req [::host
-                           ::port
-                           ::max-msgs-per-epoch
-                           ::gossip-send-count
-                           ::ping-timer
-                           ::suspect-timeout
-                           ::ack-timeout
-                           ::send-fn
-                           ::shutdown-fn]))
-
-(s/def ::srv-map (s/keys :req [::cfg ::internal-state ::state ::shutdown]))
-
 (defn srv-map [] {::cfg            default-cfg
                   ::internal-state (atom {::nodes {} ; {{:host "0.0.0.0" :port 1234} {:data {}
                                                                                   ; :state :alive or :suspect
@@ -207,7 +175,6 @@
 
 ;; Public interface
 
-
 (defn start
   "Starts a server to listen for gossip messages, and for holding cfg.
   Hang onto the return from this, you'll need it when discovering nodes or sending.
@@ -215,7 +182,7 @@
   ([] (start {}))
   ([cfg]
    (let [srv-map (assoc (srv-map) ::cfg (merge default-cfg cfg))
-         srv (hs/run-server (make-ping-handler srv-map) {:port (get-in srv-map [::cfg ::port])})
+         srv (hs/run-server (make-handler srv-map) {:port (get-in srv-map [::cfg ::port])})
          ping-time (get-in srv-map [::cfg ::ping-timer])
          control-ch (a/chan)]
      (a/go-loop []
@@ -276,3 +243,50 @@
        ::state
        (deref)
        (get key))))
+
+(s/def ::host (s/with-gen (s/and string?
+                                 #(>= (count "111.111.111.111") (count %1))
+                                 #(re-matches #"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}" %1))
+                          #(gen/fmap
+                            (partial str/join ".")
+                            (apply gen/tuple (repeatedly 4 (partial gen/choose 1 255))))))
+(s/def ::port pos-int?)
+
+(s/def ::other-node-data associative?)
+(s/def ::node-state #{:alive :suspect :dead})
+(s/def ::clk int?)
+(s/def ::last-sent-epoch int?)
+
+(s/def ::host-key-map (s/keys :req [::host ::port]))
+(s/def ::from ::host-key-map)
+(s/def ::type #{:ping :indirect-ping})
+(s/def ::messages seq?)
+
+(s/def ::other-nodes (s/map-of ::host-key-map
+                               (s/keys :req [::other-node-data ::node-state ::clk ::last-sent-epoch])))
+
+(s/def ::ordered-hosts (s/coll-of ::host-key-map))
+(s/def ::internal-state (s/keys :req [::other-nodes ::ordered-hosts ::send-queue ::epoch]))
+(s/def ::state associative?)
+
+(s/def ::max-msgs-per-epoch pos-int?)
+(s/def ::gossip-send-count pos-int?)
+(s/def ::ping-timer (s/and pos-int? #(>= % 1000)))
+(s/def ::suspect-timeout (s/and pos-int? #(>= % 1000)))
+(s/def ::ack-timeout (s/and pos-int? #(>= % 1000)))
+(s/def ::send-fn (s/with-gen fn?
+                             #(gen/return send-impl)))
+(s/def ::shutdown-fn (s/with-gen fn?
+                                 #(gen/return (fn []))))
+
+(s/def ::cfg (s/keys :req [::host
+                           ::port
+                           ::max-msgs-per-epoch
+                           ::gossip-send-count
+                           ::ping-timer
+                           ::suspect-timeout
+                           ::ack-timeout
+                           ::send-fn
+                           ::shutdown-fn]))
+
+(s/def ::srv-map (s/keys :req [::cfg ::internal-state ::state ::shutdown]))
